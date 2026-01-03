@@ -1,0 +1,5 @@
+# App team owns services
+services/ @TechITFactory/app-team
+
+# Platform team owns Helm charts
+charts/ @TechITFactory/platform-team
