@@ -1,0 +1,245 @@
+# Unified CI Workflow for All Services
+# Builds only the services that have changed
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/**'
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  # ============================================
+  # DETECT WHICH SERVICES CHANGED
+  # ============================================
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      api-gateway: ${{ steps.changes.outputs.api-gateway }}
+      product-service: ${{ steps.changes.outputs.product-service }}
+      order-service: ${{ steps.changes.outputs.order-service }}
+      cart-service: ${{ steps.changes.outputs.cart-service }}
+      user-service: ${{ steps.changes.outputs.user-service }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            api-gateway:
+              - 'services/api-gateway/**'
+            product-service:
+              - 'services/product/**'
+            order-service:
+              - 'services/order/**'
+            cart-service:
+              - 'services/cart/**'
+            user-service:
+              - 'services/user-service/**'
+            frontend:
+              - 'services/frontend/**'
+
+      - name: Set build matrix
+        id: set-matrix
+        run: |
+          MATRIX='{"include":['
+          FIRST=true
+          
+          if [ "${{ steps.changes.outputs.api-gateway }}" == "true" ]; then
+            [ "$FIRST" == "false" ] && MATRIX+=","
+            MATRIX+='{"service":"api-gateway","path":"services/api-gateway","type":"node"}'
+            FIRST=false
+          fi
+          
+          if [ "${{ steps.changes.outputs.product-service }}" == "true" ]; then
+            [ "$FIRST" == "false" ] && MATRIX+=","
+            MATRIX+='{"service":"product-service","path":"services/product","type":"node"}'
+            FIRST=false
+          fi
+          
+          if [ "${{ steps.changes.outputs.order-service }}" == "true" ]; then
+            [ "$FIRST" == "false" ] && MATRIX+=","
+            MATRIX+='{"service":"order-service","path":"services/order","type":"python"}'
+            FIRST=false
+          fi
+          
+          if [ "${{ steps.changes.outputs.cart-service }}" == "true" ]; then
+            [ "$FIRST" == "false" ] && MATRIX+=","
+            MATRIX+='{"service":"cart-service","path":"services/cart","type":"node"}'
+            FIRST=false
+          fi
+          
+          if [ "${{ steps.changes.outputs.user-service }}" == "true" ]; then
+            [ "$FIRST" == "false" ] && MATRIX+=","
+            MATRIX+='{"service":"user-service","path":"services/user-service","type":"node"}'
+            FIRST=false
+          fi
+          
+          if [ "${{ steps.changes.outputs.frontend }}" == "true" ]; then
+            [ "$FIRST" == "false" ] && MATRIX+=","
+            MATRIX+='{"service":"frontend","path":"services/frontend","type":"static"}'
+            FIRST=false
+          fi
+          
+          MATRIX+=']}'
+          
+          if [ "$MATRIX" == '{"include":[]}' ]; then
+            echo "No services changed"
+            echo "matrix=" >> $GITHUB_OUTPUT
+          else
+            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Build matrix: $MATRIX"
+
+  # ============================================
+  # TEST (for services with tests)
+  # ============================================
+  test:
+    name: Test ${{ matrix.service }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: matrix.type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: '${{ matrix.path }}/package-lock.json'
+
+      - name: Setup Python
+        if: matrix.type == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install & Test (Node)
+        if: matrix.type == 'node'
+        run: |
+          cd ${{ matrix.path }}
+          npm ci || npm install
+          npm run lint --if-present
+          npm test --if-present
+
+      - name: Install & Test (Python)
+        if: matrix.type == 'python'
+        run: |
+          cd ${{ matrix.path }}
+          pip install -r requirements.txt
+          pip install pytest flake8
+          flake8 . --max-line-length=120 --ignore=E501 || true
+          pytest --if-present || true
+
+  # ============================================
+  # BUILD & PUSH DOCKER IMAGES
+  # ============================================
+  build:
+    name: Build ${{ matrix.service }}
+    needs: [detect-changes, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.path }}
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service }}:${{ github.sha }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      - name: Summary
+        run: |
+          echo "### Built ${{ matrix.service }} 🐳" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # UPDATE GITOPS REPO
+  # ============================================
+  update-gitops:
+    name: Update GitOps
+    needs: [detect-changes, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1  # Prevent git conflicts
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: TechITFactory/techitfactory-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update image tag
+        run: |
+          cd gitops/environments/dev/${{ matrix.service }}
+          sed -i "s|newTag:.*|newTag: ${{ github.sha }}|" kustomization.yaml
+          cat kustomization.yaml
+
+      - name: Commit and push
+        run: |
+          cd gitops
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@techitfactory.com"
+          git pull --rebase
+          git add .
+          git diff --staged --quiet || git commit -m "chore(dev): Update ${{ matrix.service }} to ${{ github.sha }}"
+          git push
