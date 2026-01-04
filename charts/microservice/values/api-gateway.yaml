@@ -1,0 +1,38 @@
+# API Gateway values
+replicaCount: 2
+
+image:
+  repository: <AWS_ACCOUNT>.dkr.ecr.ap-south-1.amazonaws.com/techitfactory/api-gateway
+  tag: latest
+
+service:
+  port: 80
+  targetPort: 3000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+env:
+  - name: PRODUCT_SERVICE_URL
+    value: "http://product-service"
+  - name: ORDER_SERVICE_URL
+    value: "http://order-service"
+  - name: USER_SERVICE_URL
+    value: "http://user-service"
+  - name: NODE_ENV
+    value: "production"
+
+probes:
+  liveness:
+    enabled: true
+    path: /health
+    port: 3000
+  readiness:
+    enabled: true
+    path: /ready
+    port: 3000

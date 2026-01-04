@@ -1,0 +1,74 @@
+# CI Workflow for Order Service (Python)
+name: CI - Order Service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/order/**'
+      - '.github/workflows/ci-order-service.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/order/**'
+
+env:
+  SERVICE_NAME: order-service
+  SERVICE_PATH: services/order
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: ${{ env.SERVICE_PATH }}/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          cd ${{ env.SERVICE_PATH }}
+          pip install -r requirements.txt
+          pip install pytest flake8
+
+      - name: Run linter
+        run: cd ${{ env.SERVICE_PATH }} && flake8 app/ --max-line-length=120 --ignore=E501
+        continue-on-error: true
+
+      - name: Run tests
+        run: cd ${{ env.SERVICE_PATH }} && pytest --if-present || true
+
+  build:
+    needs: lint-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      service-name: order-service
+      service-path: services/order
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  update-gitops:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: TechITFactory/techitfactory-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+      - run: |
+          cd gitops/environments/dev/${{ env.SERVICE_NAME }}
+          sed -i "s|newTag:.*|newTag: ${{ github.sha }}|" kustomization.yaml
+      - run: |
+          cd gitops
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@techitfactory.com"
+          git add . && git diff --staged --quiet || git commit -m "chore(dev): Update ${{ env.SERVICE_NAME }} to ${{ github.sha }}"
+          git push

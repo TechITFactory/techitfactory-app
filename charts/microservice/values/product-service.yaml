@@ -1,0 +1,32 @@
+# Product Service values
+replicaCount: 2
+
+image:
+  repository: <AWS_ACCOUNT>.dkr.ecr.ap-south-1.amazonaws.com/techitfactory/product-service
+  tag: latest
+
+service:
+  port: 80
+  targetPort: 3000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+env:
+  - name: NODE_ENV
+    value: "production"
+
+probes:
+  liveness:
+    enabled: true
+    path: /health
+    port: 3000
+  readiness:
+    enabled: true
+    path: /ready
+    port: 3000

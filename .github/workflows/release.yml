@@ -1,0 +1,127 @@
+# Release to Production Workflow
+name: Release to Production
+
+on:
+  release:
+    types: [published]
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  validate-release:
+    name: Validate Release Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate semver format
+        run: |
+          TAG=${{ github.event.release.tag_name }}
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Invalid tag format: $TAG"
+            echo "Expected format: vX.Y.Z (e.g., v1.0.0)"
+            exit 1
+          fi
+          echo "✅ Valid release tag: $TAG"
+
+  build-all-services:
+    name: Build ${{ matrix.service.name }}
+    needs: validate-release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        service:
+          - name: api-gateway
+            path: services/api-gateway
+          - name: product-service
+            path: services/product
+          - name: order-service
+            path: services/order
+          - name: cart-service
+            path: services/cart
+          - name: user-service
+            path: services/user-service
+          - name: frontend
+            path: services/frontend
+      fail-fast: false
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push with release tag
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.path }}
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service.name }}:${{ github.event.release.tag_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Built ${{ matrix.service.name }} 🐳" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ github.event.release.tag_name }}" >> $GITHUB_STEP_SUMMARY
+
+  update-prod-gitops:
+    name: Update Production
+    needs: build-all-services
+    runs-on: ubuntu-latest
+    environment: production  # Requires approval!
+    
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: TechITFactory/techitfactory-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Setup yq
+        uses: mikefarah/yq@master
+
+      - name: Update all service tags for prod
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          cd gitops/environments/prod
+          
+          for service in api-gateway product-service order-service cart-service user-service frontend; do
+            if [ -d "$service" ]; then
+              yq -i '.images[0].newTag = strenv(RELEASE_TAG)' $service/kustomization.yaml
+              echo "✅ Updated $service to $RELEASE_TAG"
+            fi
+          done
+
+      - name: Commit and push
+        run: |
+          cd gitops
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@techitfactory.com"
+          git add .
+          git commit -m "release: Promote ${{ github.event.release.tag_name }} to production"
+          git push
+
+      - name: Summary
+        run: |
+          echo "### Production Release 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ github.event.release.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Release Notes:** ${{ github.event.release.html_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ArgoCD will sync the changes. Run \`argocd app sync <app>-prod\` if manual sync is required." >> $GITHUB_STEP_SUMMARY

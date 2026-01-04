@@ -1,0 +1,30 @@
+# Frontend values
+replicaCount: 2
+
+image:
+  repository: <AWS_ACCOUNT>.dkr.ecr.ap-south-1.amazonaws.com/techitfactory/frontend
+  tag: latest
+
+service:
+  port: 80
+  targetPort: 80
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+probes:
+  liveness:
+    enabled: true
+    path: /health
+    port: 80
+  readiness:
+    enabled: true
+    path: /
+    port: 80
+
+podAnnotations: {}

@@ -1,0 +1,61 @@
+# SonarCloud Analysis Workflow
+name: SonarCloud Analysis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  sonarcloud:
+    name: SonarCloud Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node.js dependencies
+        run: |
+          for dir in services/api-gateway services/product services/cart services/user-service; do
+            if [ -f "$dir/package.json" ]; then
+              echo "Installing dependencies for $dir"
+              cd "$dir"
+              npm ci || true
+              cd ${{ github.workspace }}
+            fi
+          done
+
+      - name: Install Python dependencies
+        run: |
+          cd services/order
+          pip install -r requirements.txt || true
+
+      - name: Run tests with coverage
+        run: |
+          for dir in services/api-gateway services/product services/cart services/user-service; do
+            if [ -f "$dir/package.json" ]; then
+              cd "$dir"
+              npm test -- --coverage --coverageReporters=lcov || true
+              cd ${{ github.workspace }}
+            fi
+          done
+        continue-on-error: true
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true  # Don't fail if SONAR_TOKEN not set

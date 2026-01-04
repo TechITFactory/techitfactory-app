@@ -1,0 +1,20 @@
+{
+    "name": "user-service",
+    "version": "1.0.0",
+    "description": "User microservice for TechITFactory",
+    "main": "src/index.js",
+    "scripts": {
+        "start": "node src/index.js",
+        "dev": "nodemon src/index.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "prom-client": "^15.0.0",
+        "winston": "^3.11.0",
+        "bcryptjs": "^2.4.3",
+        "jsonwebtoken": "^9.0.0"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.0"
+    }
+}

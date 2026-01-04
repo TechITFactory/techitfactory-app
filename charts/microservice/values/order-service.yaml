@@ -1,0 +1,37 @@
+# Order Service values
+replicaCount: 2
+
+image:
+  repository: <AWS_ACCOUNT>.dkr.ecr.ap-south-1.amazonaws.com/techitfactory/order-service
+  tag: latest
+
+service:
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+env:
+  - name: PYTHONUNBUFFERED
+    value: "1"
+
+probes:
+  liveness:
+    enabled: true
+    path: /health
+    port: 8000
+  readiness:
+    enabled: true
+    path: /ready
+    port: 8000
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: "/metrics"
