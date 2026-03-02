@@ -23,11 +23,20 @@ resources:
     memory: 256Mi
 
 probes:
+  # Startup probe gives slow-starting containers time to initialise
+  # before liveness kicks in (failureThreshold * periodSeconds = max startup time)
+  startup:
+    enabled: true
+    path: /health
+    port: 3000
+    failureThreshold: 30   # 30 * 5s = 90s max startup window
+    periodSeconds: 5
+    timeoutSeconds: 3
   liveness:
     enabled: true
     path: /health
     port: 3000
-    initialDelaySeconds: 10
+    initialDelaySeconds: 0  # startup probe handles the delay
     periodSeconds: 10
     timeoutSeconds: 3
     failureThreshold: 3
@@ -35,7 +44,7 @@ probes:
     enabled: true
     path: /ready
     port: 3000
-    initialDelaySeconds: 5
+    initialDelaySeconds: 0
     periodSeconds: 5
     timeoutSeconds: 3
     failureThreshold: 3
@@ -82,6 +91,15 @@ securityContext:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# PodDisruptionBudget — ensures at least 1 pod stays up during node drain / rolling update
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# NetworkPolicy — restricts inbound traffic to same namespace + monitoring namespace
+networkPolicy:
+  enabled: true
 
 ingress:
   enabled: false

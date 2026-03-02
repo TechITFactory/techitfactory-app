@@ -6,7 +6,13 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'techitfactory-secret-key';
+
+// JWT_SECRET is required — fail fast if not provided
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error('FATAL: JWT_SECRET environment variable is required. Set it via a Kubernetes Secret.');
+    process.exit(1);
+}
 
 // Logger
 const logger = winston.createLogger({
@@ -19,8 +25,7 @@ const logger = winston.createLogger({
 });
 
 // Prometheus Metrics
-const collectDefaultMetrics = client.collectDefaultMetrics;
-collectDefaultMetrics({ timeout: 5000 });
+client.collectDefaultMetrics();
 
 const httpRequestsTotal = new client.Counter({
     name: 'http_requests_total',
@@ -28,13 +33,22 @@ const httpRequestsTotal = new client.Counter({
     labelNames: ['method', 'path', 'status']
 });
 
-// Mock user database
-const users = [
-    { id: 1, email: 'admin@techitfactory.com', password: bcrypt.hashSync('admin123', 10), role: 'admin', name: 'Admin User' },
-    { id: 2, email: 'user@techitfactory.com', password: bcrypt.hashSync('user123', 10), role: 'user', name: 'Regular User' }
-];
+// In-memory user store — seeded from environment variables, never hardcoded
+const users = [];
+let nextUserId = 1;
 
-let nextUserId = 3;
+if (process.env.SEED_ADMIN_PASSWORD) {
+    users.push({
+        id: nextUserId++,
+        email: process.env.SEED_ADMIN_EMAIL || 'admin@techitfactory.com',
+        password: bcrypt.hashSync(process.env.SEED_ADMIN_PASSWORD, 10),
+        role: 'admin',
+        name: 'Admin User'
+    });
+    logger.info({ message: 'Admin user seeded from environment' });
+} else {
+    logger.warn({ message: 'No SEED_ADMIN_PASSWORD set — no admin user created. Register via POST /users/register.' });
+}
 
 // Middleware
 app.use(express.json());

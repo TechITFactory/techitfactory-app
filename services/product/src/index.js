@@ -16,8 +16,7 @@ const logger = winston.createLogger({
 });
 
 // Prometheus Metrics
-const collectDefaultMetrics = client.collectDefaultMetrics;
-collectDefaultMetrics({ timeout: 5000 });
+client.collectDefaultMetrics();
 
 const httpRequestsTotal = new client.Counter({
     name: 'http_requests_total',

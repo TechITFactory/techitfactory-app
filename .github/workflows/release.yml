@@ -93,7 +93,7 @@ jobs:
           path: gitops
 
       - name: Setup yq
-        uses: mikefarah/yq@master
+        uses: mikefarah/yq@v4.45.1
 
       - name: Update all service tags for prod
         env:
@@ -113,8 +113,9 @@ jobs:
           cd gitops
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@techitfactory.com"
+          git pull --rebase
           git add .
-          git commit -m "release: Promote ${{ github.event.release.tag_name }} to production"
+          git diff --staged --quiet || git commit -m "release: Promote ${{ github.event.release.tag_name }} to production"
           git push
 
       - name: Summary
