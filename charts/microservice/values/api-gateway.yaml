@@ -2,7 +2,7 @@
 replicaCount: 2
 
 image:
-  repository: <AWS_ACCOUNT>.dkr.ecr.ap-south-1.amazonaws.com/techitfactory/api-gateway
+  repository: 535002890483.dkr.ecr.ap-south-1.amazonaws.com/techitfactory/api-gateway
   tag: latest
 
 service:
