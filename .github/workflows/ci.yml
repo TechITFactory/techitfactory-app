@@ -1,5 +1,21 @@
-# Unified CI Workflow for All Services
-# Builds only the services that have changed
+# =============================================================================
+# APP CI/CD — PRODUCTION-GRADE
+# =============================================================================
+#
+# FLOW:
+#   Push to main  → detect-changes → test → build+ECR push → update-gitops
+#   Pull Request  → detect-changes → test (no build, no push)
+#
+# GitOps loop:
+#   ci.yml updates kustomization.yaml in techitfactory-gitops
+#   ArgoCD detects the change and deploys to the cluster
+#   ci.yml never touches Kubernetes directly
+#
+# CONCURRENCY:
+#   One CI run per branch at a time. If a new push lands while a run is active,
+#   the old run is cancelled (safe — build/push is idempotent on ECR).
+#   update-gitops uses max-parallel:1 to prevent concurrent git conflicts.
+# =============================================================================
 
 name: CI
 
@@ -13,6 +29,12 @@ on:
     branches: [main]
     paths:
       - 'services/**'
+
+# Cancel in-progress runs for the same branch when a new push arrives.
+# Safe because ECR pushes are idempotent (same SHA tag = no-op if re-pushed).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   AWS_REGION: ap-south-1
@@ -218,8 +240,11 @@ jobs:
     needs: [detect-changes, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.matrix != ''
     runs-on: ubuntu-latest
+    # Explicit permissions — this job only needs to write to gitops (via PAT), not AWS
+    permissions:
+      contents: read
     strategy:
-      max-parallel: 1  # Prevent git conflicts
+      max-parallel: 1  # Prevent concurrent git push conflicts
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
 
     steps:
@@ -230,11 +255,23 @@ jobs:
           token: ${{ secrets.GITOPS_TOKEN }}
           path: gitops
 
-      - name: Update image tag
+      - name: Install yq
         run: |
-          cd gitops/environments/dev/${{ matrix.service }}
-          sed -i "s|newTag:.*|newTag: ${{ github.sha }}|" kustomization.yaml
-          cat kustomization.yaml
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Update image tag
+        # Use yq (not sed) — sed is fragile if kustomization.yaml has comments
+        # or multiple fields with 'newTag'. yq targets the exact YAML key.
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          yq -i '.images[0].newTag = strenv(IMAGE_TAG)' \
+            gitops/environments/dev/${{ matrix.service }}/kustomization.yaml
+          echo "Updated ${{ matrix.service }} → ${{ github.sha }}"
+          cat gitops/environments/dev/${{ matrix.service }}/kustomization.yaml
 
       - name: Commit and push
         run: |
@@ -243,5 +280,15 @@ jobs:
           git config user.email "actions@techitfactory.com"
           git pull --rebase
           git add .
-          git diff --staged --quiet || git commit -m "chore(dev): Update ${{ matrix.service }} to ${{ github.sha }}"
+          git diff --staged --quiet || \
+            git commit -m "chore(dev): Update ${{ matrix.service }} to ${{ github.sha }}"
           git push
+
+      - name: Summary
+        run: |
+          echo "### 🔄 GitOps Updated" >> $GITHUB_STEP_SUMMARY
+          echo "**Service:** \`${{ matrix.service }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Env:** \`dev\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ArgoCD will auto-sync within ~3 minutes." >> $GITHUB_STEP_SUMMARY

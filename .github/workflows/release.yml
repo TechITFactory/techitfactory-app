@@ -1,36 +1,71 @@
-# Release to Production Workflow
+# =============================================================================
+# RELEASE TO PRODUCTION — PRODUCTION-GRADE
+# =============================================================================
+#
+# TRIGGER: GitHub Release published with a semver tag (vX.Y.Z)
+#
+# FLOW:
+#   1. validate-release   → checks tag format is vX.Y.Z
+#   2. build-all-services → builds ALL 6 services with release tag + Trivy scan
+#   3. update-prod-gitops → requires GitHub "production" environment approval
+#                           updates kustomization.yaml in environments/prod/
+#   4. notify-release     → Slack notification on success
+#
+# WHY ALL SERVICES?
+#   A release tag represents a tested snapshot of the whole system.
+#   All services get the same version tag to keep environments consistent.
+#
+# PRODUCTION GATE:
+#   The update-prod-gitops job uses `environment: production` which requires
+#   manual approval from a team lead before prod GitOps is updated.
+#   ArgoCD prod apps are set to MANUAL sync — deploying to prod EKS
+#   still requires a human to run `argocd app sync <app>-prod`.
+# =============================================================================
+
 name: Release to Production
 
 on:
   release:
     types: [published]
 
+# Never cancel a release run — partial builds leave prod in an inconsistent state
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 env:
   AWS_REGION: ap-south-1
 
 jobs:
+  # ===========================================================================
+  # STEP 1: Validate tag format
+  # ===========================================================================
   validate-release:
     name: Validate Release Tag
     runs-on: ubuntu-latest
     steps:
-      - name: Validate semver format
+      - name: Validate semver format (vX.Y.Z)
         run: |
           TAG=${{ github.event.release.tag_name }}
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "❌ Invalid tag format: $TAG"
-            echo "Expected format: vX.Y.Z (e.g., v1.0.0)"
+            echo "Expected format: vX.Y.Z (e.g., v1.2.3)"
             exit 1
           fi
           echo "✅ Valid release tag: $TAG"
 
+  # ===========================================================================
+  # STEP 2: Build all services + Trivy scan
+  # ===========================================================================
   build-all-services:
-    name: Build ${{ matrix.service.name }}
+    name: "Build & Scan: ${{ matrix.service.name }}"
     needs: validate-release
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      id-token: write   # OIDC → AWS credentials
       contents: read
     strategy:
+      fail-fast: false  # If one service scan fails, don't cancel others
       matrix:
         service:
           - name: api-gateway
@@ -45,12 +80,11 @@ jobs:
             path: services/user-service
           - name: frontend
             path: services/frontend
-      fail-fast: false
-    
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -70,20 +104,40 @@ jobs:
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service.name }}:${{ github.event.release.tag_name }}
+          # Do NOT tag :latest on release builds — latest should come from dev CI
+          # so it's clear what's actually running in each environment
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Run Trivy security scan
+        # Production images MUST pass Trivy — CRITICAL/HIGH vulnerabilities block the release
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service.name }}:${{ github.event.release.tag_name }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'          # Hard fail — block release on security issues
+          ignore-unfixed: true    # Skip vulns with no available fix
+
       - name: Summary
         run: |
-          echo "### Built ${{ matrix.service.name }} 🐳" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** ${{ github.event.release.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ ${{ matrix.service.name }} built & scanned" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ github.event.release.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.login-ecr.outputs.registry }}/techitfactory/${{ matrix.service.name }}:${{ github.event.release.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
 
+  # ===========================================================================
+  # STEP 3: Update prod GitOps (requires manual approval)
+  # ===========================================================================
   update-prod-gitops:
-    name: Update Production
+    name: Update Production GitOps
     needs: build-all-services
     runs-on: ubuntu-latest
-    environment: production  # Requires approval!
-    
+    # ⚠️ APPROVAL GATE: GitHub repo → Settings → Environments → "production"
+    # Add required reviewers. This job will pause until a team lead approves.
+    environment: production
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout GitOps repo
         uses: actions/checkout@v4
@@ -92,19 +146,27 @@ jobs:
           token: ${{ secrets.GITOPS_TOKEN }}
           path: gitops
 
-      - name: Setup yq
-        uses: mikefarah/yq@v4.45.1
+      - name: Install yq
+        # Install yq binary directly — the mikefarah/yq action requires a 'cmd'
+        # input and is not a bare installer. Direct binary install is more reliable.
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
 
       - name: Update all service tags for prod
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           cd gitops/environments/prod
-          
+
           for service in api-gateway product-service order-service cart-service user-service frontend; do
             if [ -d "$service" ]; then
               yq -i '.images[0].newTag = strenv(RELEASE_TAG)' $service/kustomization.yaml
-              echo "✅ Updated $service to $RELEASE_TAG"
+              echo "✅ Updated $service → $RELEASE_TAG"
+            else
+              echo "⚠️  Skipped $service — directory not found"
             fi
           done
 
@@ -115,14 +177,59 @@ jobs:
           git config user.email "actions@techitfactory.com"
           git pull --rebase
           git add .
-          git diff --staged --quiet || git commit -m "release: Promote ${{ github.event.release.tag_name }} to production"
+          git diff --staged --quiet || \
+            git commit -m "release: Promote ${{ github.event.release.tag_name }} to production"
           git push
 
       - name: Summary
         run: |
-          echo "### Production Release 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Production GitOps Updated" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ github.event.release.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ github.event.release.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Release Notes:** ${{ github.event.release.html_url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "ArgoCD will sync the changes. Run \`argocd app sync <app>-prod\` if manual sync is required." >> $GITHUB_STEP_SUMMARY
+          echo "> ArgoCD prod apps use **manual sync**." >> $GITHUB_STEP_SUMMARY
+          echo "> Run: \`argocd app sync <service>-prod\` to deploy." >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # STEP 4: Slack notification
+  # ===========================================================================
+  notify-release:
+    name: Notify Slack
+    needs: update-prod-gitops
+    runs-on: ubuntu-latest
+    # Run even if prod gitops step failed — so team knows something went wrong
+    if: always()
+    permissions:
+      contents: none
+
+    steps:
+      - name: Send Slack notification
+        # v1.27.0 is stable — v2 changed the interface (method/token vs payload/env)
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ needs.update-prod-gitops.result == 'success' && '🚀' || '❌' }} *Production Release — ${{ github.event.release.tag_name }}*\n*Status:* ${{ needs.update-prod-gitops.result }}\n*Release Notes:* ${{ github.event.release.html_url }}\n*Released by:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View Release" },
+                      "url": "${{ github.event.release.html_url }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true  # Don't fail the pipeline if Slack is not configured
