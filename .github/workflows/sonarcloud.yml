@@ -1,0 +1,128 @@
+# =============================================================================
+# SONARCLOUD — PRODUCTION-GRADE QUALITY GATE
+# =============================================================================
+#
+# WHAT THIS DOES:
+#   - Runs on every push to main and every PR targeting main
+#   - Installs deps and runs tests WITH coverage for all services
+#   - Sends coverage reports to SonarCloud
+#   - Quality Gate BLOCKS merges if it fails — no continue-on-error anywhere
+#
+# QUALITY GATE (configure in SonarCloud dashboard):
+#   - New Code Coverage >= 70%
+#   - Bugs = 0
+#   - Vulnerabilities = 0
+#   - Security Hotspots reviewed = 100%
+#
+# PREREQUISITE: Add SONAR_TOKEN secret before enabling branch protection rules.
+#   See: runbooks/sprint5/S9.2_SONARCLOUD.md for full setup.
+#   sonar.qualitygate.wait=true in sonar-project.properties makes this step
+#   block until SonarCloud returns pass/fail.
+# =============================================================================
+
+name: SonarCloud Analysis
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'sonar-project.properties'
+      - '.github/workflows/sonarcloud.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/**'
+
+# Cancel stale scans when new pushes arrive — analysis is idempotent
+concurrency:
+  group: sonar-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read  # Needed for SonarCloud PR decoration
+
+jobs:
+  sonarcloud:
+    name: SonarCloud Quality Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full git history — SonarCloud uses it for blame/diff
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # -----------------------------------------------------------------------
+      # Install dependencies — no || true, failures must surface
+      # -----------------------------------------------------------------------
+      - name: Install Node.js dependencies
+        run: |
+          for dir in services/api-gateway services/product services/cart services/user-service services/frontend; do
+            if [ -f "$dir/package.json" ]; then
+              echo "Installing: $dir"
+              cd "$dir"
+              npm ci
+              cd "$GITHUB_WORKSPACE"
+            fi
+          done
+
+      - name: Install Python dependencies (order-service)
+        run: |
+          cd services/order
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      # -----------------------------------------------------------------------
+      # Run tests WITH coverage — no || true, no continue-on-error
+      # Test failures here mean the quality gate correctly rejects bad code
+      # -----------------------------------------------------------------------
+      - name: Run Node.js tests with coverage
+        run: |
+          FAILED=""
+          for dir in services/api-gateway services/product services/cart services/user-service; do
+            if [ -f "$dir/package.json" ]; then
+              echo "Testing: $dir"
+              cd "$dir"
+              # --coverageReporters=lcov writes coverage/lcov.info for SonarCloud
+              npm test -- --coverage --coverageReporters=lcov --coverageReporters=text \
+                || FAILED="$FAILED $dir"
+              cd "$GITHUB_WORKSPACE"
+            fi
+          done
+          if [ -n "$FAILED" ]; then
+            echo "Tests failed in:$FAILED"
+            exit 1
+          fi
+
+      - name: Run Python tests with coverage (order-service)
+        run: |
+          cd services/order
+          # exit 5 = no tests collected (acceptable for walking skeleton phase)
+          # any other non-zero = real failure
+          python -m pytest --cov=. --cov-report=xml:coverage.xml --tb=short -q
+          EXIT=$?
+          [ $EXIT -eq 0 ] || [ $EXIT -eq 5 ] || exit $EXIT
+
+      # -----------------------------------------------------------------------
+      # SonarCloud scan + quality gate
+      # Pin to a specific tag — @master means your scan changes without notice
+      # -----------------------------------------------------------------------
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        # NO continue-on-error — quality gate failures block the pipeline.
+        # sonar.qualitygate.wait=true in sonar-project.properties makes this
+        # step exit non-zero if the quality gate fails.

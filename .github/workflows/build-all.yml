@@ -1,0 +1,213 @@
+# =============================================================================
+# BUILD ALL SERVICES — SEED WORKFLOW
+# =============================================================================
+#
+# PURPOSE:
+#   Run ONCE after platform-bootstrap.yml to build and push all 6 service
+#   images to ECR. Updates all kustomization.yaml files in the GitOps repo
+#   with the real image tags so ArgoCD can deploy the applications.
+#
+# WHEN TO USE:
+#   1. First-time setup (Sprint 5 kickoff)
+#   2. After infra teardown + rebuild (fresh ECR repos)
+#   3. Force-rebuild all services (e.g., base image security patch)
+#
+# NORMAL FLOW (day-to-day):
+#   Use ci.yml — it only builds services that changed.
+#   This workflow builds everything regardless.
+#
+# FLOW:
+#   workflow_dispatch
+#       └─ build-and-push (matrix: all 6 services in parallel)
+#              └─ update-gitops (sequential: update each kustomization.yaml)
+# =============================================================================
+
+name: Build All Services
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to update in GitOps'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      image_tag:
+        description: 'Image tag to use (default: git SHA)'
+        required: false
+        default: ''
+
+concurrency:
+  group: build-all-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCOUNT_ID: 'YOUR_AWS_ACCOUNT_ID'
+  ECR_REGISTRY: YOUR_AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com
+
+jobs:
+  # ===========================================================================
+  # BUILD & PUSH ALL SERVICES IN PARALLEL
+  # ===========================================================================
+  build-and-push:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # Build all services even if one fails
+      matrix:
+        include:
+          - service: frontend
+            path: services/frontend
+            ecr_repo: techitfactory/frontend
+          - service: api-gateway
+            path: services/api-gateway
+            ecr_repo: techitfactory/api-gateway
+          - service: user-service
+            path: services/user-service
+            ecr_repo: techitfactory/user-service
+          - service: order-service
+            path: services/order
+            ecr_repo: techitfactory/order-service
+          - service: product-service
+            path: services/product
+            ecr_repo: techitfactory/product-service
+          - service: cart-service
+            path: services/cart
+            ecr_repo: techitfactory/cart-service
+
+    outputs:
+      # Pass image tag to update-gitops job
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Determine image tag
+        id: meta
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            TAG="${{ inputs.image_tag }}"
+          else
+            TAG="${{ github.sha }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${TAG}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.path }}
+          file: ${{ matrix.path }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy
+
+      - name: Scan image for vulnerabilities (Trivy)
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            --no-progress \
+            ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ steps.meta.outputs.tag }}
+
+  # ===========================================================================
+  # UPDATE GITOPS REPO — SEQUENTIAL (prevent git conflicts)
+  # ===========================================================================
+  update-gitops:
+    name: Update GitOps (${{ matrix.service }})
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1    # Sequential to avoid git push conflicts
+      fail-fast: false
+      matrix:
+        include:
+          - service: frontend
+          - service: api-gateway
+          - service: user-service
+          - service: order-service
+          - service: product-service
+          - service: cart-service
+
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: YOUR_GITHUB_ORG/techitfactory-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "value=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update image tag in kustomization
+        run: |
+          KUSTOMIZE_FILE="gitops/environments/${{ inputs.environment }}/${{ matrix.service }}/kustomization.yaml"
+
+          if [ ! -f "${KUSTOMIZE_FILE}" ]; then
+            echo "WARNING: ${KUSTOMIZE_FILE} not found — skipping"
+            exit 0
+          fi
+
+          echo "Updating ${KUSTOMIZE_FILE} → tag: ${{ steps.tag.outputs.value }}"
+          yq -i '.images[0].newTag = "${{ steps.tag.outputs.value }}"' "${KUSTOMIZE_FILE}"
+          cat "${KUSTOMIZE_FILE}"
+
+      - name: Commit and push
+        run: |
+          cd gitops
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add environments/${{ inputs.environment }}/${{ matrix.service }}/kustomization.yaml
+
+          if git diff --staged --quiet; then
+            echo "No changes for ${{ matrix.service }} — skipping commit"
+          else
+            git commit -m "chore: seed ${{ matrix.service }} → ${{ steps.tag.outputs.value }} [${{ inputs.environment }}]
+
+            Built by: ${{ github.actor }}
+            Workflow: ${{ github.workflow }} run #${{ github.run_number }}"
+            git push
+          fi
